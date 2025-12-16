@@ -21,11 +21,11 @@
 
 | 特性 | Transformer | GPT |
 |-----|-----------|-----|
-| 结构 | Encoder + Decoder | 仅Decoder |
-| 用途 | 机器翻译、文本摘要（Seq2Seq） | 文本生成、语言建模 |
-| 输入 | x1（目标）+ x2（源） | 仅历史token（自回归） |
-| 数据流 | x1和x2交互（cross-attention） | 仅self-attention（masked） |
-| 信息交互 | 源→目标序列 | 序列内部（前→后） |
+| 结构 | Encoder（处理x2） + Decoder（处理x1） | 仅Decoder（处理x1） |
+| 用途 | 机器翻译、文本摘要（Seq2Seq，x2→x1） | 文本生成、语言建模（x1自回归） |
+| 输入 | x1（目标序列）+ x2（源序列） | 仅x1（历史token的自回归） |
+| 数据流 | x1和x2交互（cross-attention，x1←x2） | 仅x1自注意力（masked） |
+| 信息交互 | 源序列x2→目标序列x1 | x1序列内部（前→后） |
 
 ### 为什么单独实现
 
@@ -202,17 +202,18 @@ class DecoderLayer(nn.Module):
         self.pos_ffn = PoswiseFeedForwardNet()
     
     def forward(self, dec_inputs, attn_mask):
-        # dec_inputs 的维度是 [batch_size, seq_len, d_embedding]
-        # attn_mask 的维度是 [batch_size, seq_len, seq_len]
+        # dec_inputs: [batch_size, seq_len, d_embedding] - x1 隐藏状态
+        # attn_mask: [batch_size, seq_len, seq_len] - 后续掩码（防止看未来）
         
-        # 仅masked self-attention，无cross-attention（这是GPT的特点）
+        # 仅 masked self-attention，无 cross-attention（这是 GPT 的特点）
+        # x1 仅关注自己和之前的 x1_token，实现自回归
         dec_outputs, dec_attn = self.dec_self_attn(dec_inputs, dec_inputs, 
                                                     dec_inputs, attn_mask)
-        # dec_outputs 的维度是 [batch_size, seq_len, d_embedding] 
+        # dec_outputs: [batch_size, seq_len, d_embedding] - x1 经过多头注意力融合
         
-        # 前馈网络
+        # 前馈网络进一步处理 x1
         dec_outputs = self.pos_ffn(dec_outputs)
-        # dec_outputs 的维度是 [batch_size, seq_len, d_embedding] 
+        # dec_outputs: [batch_size, seq_len, d_embedding] - 最终的 x1 输出
         
         return dec_outputs, dec_attn
 ```
@@ -239,27 +240,30 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)]) 
     
     def forward(self, dec_inputs):
-        # dec_inputs: [batch_size, seq_len]
+        # dec_inputs: [batch_size, seq_len] - x1_token 索引序列
         
         # 创建位置索引，支持batch
         positions = torch.arange(dec_inputs.size(1), device=dec_inputs.device).unsqueeze(0).expand(dec_inputs.size(0), -1)
-        # positions: [batch_size, seq_len]
+        # positions: [batch_size, seq_len] - 位置编码用于捕捉序列顺序
         
-        # 词嵌入 + 位置编码
+        # x1 词嵌入 + 位置编码
         inputs_embedding = self.src_emb(dec_inputs) + self.pos_emb(positions)
-        # inputs_embedding: [batch_size, seq_len, d_embedding]
+        # inputs_embedding: [batch_size, seq_len, d_embedding=512] - x1 初始隐藏状态
         
         # 生成后续掩码（防止看未来）
+        # 这是 GPT 自回归性的关键：每个位置只能关注自己和之前的位置
         attn_mask = get_attn_subsequent_mask(dec_inputs).to(dec_inputs.device)
         # attn_mask: [batch_size, seq_len, seq_len]
         
+        # x1 经过多层解码器更新
         dec_outputs = inputs_embedding
         
-        # 通过N层解码器
+        # 通过N层解码器（每层都是 masked self-attention + FFN）
         for layer in self.layers:
+            # x1 在每层自我更新（仅关注自己和历史 x1_token）
             dec_outputs, dec_attn = layer(dec_outputs, attn_mask) 
         
-        return dec_outputs  # [batch_size, seq_len, d_embedding]
+        return dec_outputs  # [batch_size, seq_len, d_embedding=512] - 最终的 x1 隐藏状态
 ```
 
 ### GPT模型
@@ -272,10 +276,13 @@ class GPT(nn.Module):
         self.projection = nn.Linear(d_embedding, vocab_size)  # 输出层
     
     def forward(self, dec_inputs):
-        # dec_inputs: [batch_size, seq_len]
+        # dec_inputs: [batch_size, seq_len] - x1_token 索引序列
         
-        dec_outputs = self.decoder(dec_inputs)  # [batch_size, seq_len, d_embedding]
-        logits = self.projection(dec_outputs)   # [batch_size, seq_len, vocab_size]
+        # 通过解码器处理 x1_token 序列
+        dec_outputs = self.decoder(dec_inputs)  # [batch_size, seq_len, d_embedding=512] - x1 隐藏状态
+        
+        # 将 x1 隐藏状态投影到词表
+        logits = self.projection(dec_outputs)   # [batch_size, seq_len, vocab_size] - 每个位置的 x1_token 概率分布
         
         return logits
 ```
@@ -295,8 +302,11 @@ from collections import Counter
 
 class LanguageCorpus:
     def __init__(self, sentences):
+        # sentences: 句子列表，每句由 x1_token 或 x2_token 组成
+        # 例如：['x1_token1 x1_token2 x1_token3', 'x1_token2 x1_token3 x1_token4']
         self.sentences = sentences
         # 计算最大句子长度，加2容纳<sos>和<eos>
+        # 最终序列形状为 [batch_size, seq_len]
         self.seq_len = max([len(sentence.split()) for sentence in sentences]) + 2
         self.vocab = self.create_vocabulary()
         self.idx2word = {v: k for k, v in self.vocab.items()}
@@ -321,12 +331,14 @@ class LanguageCorpus:
         
         for index in sentence_indices:
             sentence = self.sentences[index]
-            # 转换为索引序列：<sos> + words + <eos> + padding
+            # 转换为索引序列：<sos> + x1_tokens + <eos> + padding
+            # 表示解码器隐藏状态 x1 的 token 序列
             seq = [self.vocab['<sos>']] + [self.vocab[word] for word in sentence.split()] + [self.vocab['<eos>']]
             seq += [self.vocab['<pad>']] * (self.seq_len - len(seq))
             
-            # 输入为seq[:-1]（去掉最后一个token）
-            # 输出为seq[1:]（去掉第一个token）
+            # 输入为seq[:-1]（去掉最后一个token），形状 [batch_size, seq_len]
+            # 输出为seq[1:]（去掉第一个token），形状 [batch_size, seq_len]
+            # 实现"前n-1个x1_token预测第n个x1_token"的自回归训练
             input_batch.append(seq[:-1])
             output_batch.append(seq[1:])
         
@@ -341,16 +353,16 @@ class LanguageCorpus:
 ### 读取语料库
 
 ```python
-with open("lang.txt", "r") as file:  # 从文件读取语料
+with open("lang.txt", "r") as file:  # 从文件读取语料（每行为一句包含 x1_token 的文本）
     sentences = [line.strip() for line in file.readlines()]
+    # 例如：['x1_token1 x1_token2 x1_token3', 'x1_token2 x1_token3 x1_token4 x1_token5']
 
 corpus = LanguageCorpus(sentences)  # 创建语料库
-vocab_size = len(corpus.vocab)      # 词汇表大小
-max_seq_len = corpus.seq_len        # 最大句子长度
+vocab_size = len(corpus.vocab)      # 词汇表大小（包含<pad>, <sos>, <eos>和各个x1_token）
+max_seq_len = corpus.seq_len        # 最大句子长度（用于位置编码和序列补全）
 
 print(f"语料库词汇表大小: {vocab_size}")
-print(f"最长句子长度: {max_seq_len}")
-```
+print(f"最长句子长度 (含<sos>和<eos>): {max_seq_len}")
 
 ---
 
@@ -371,13 +383,16 @@ for epoch in range(epochs):
     optimizer.zero_grad()  # 梯度清零
     
     # 创建训练数据
+    # inputs: [batch_size, seq_len] - x1_token索引序列（前n-1位置）
+    # targets: [batch_size, seq_len] - x1_token索引序列（后n-1位置，用于监督）
     inputs, targets = corpus.make_batch(batch_size)
     inputs, targets = inputs.to(device), targets.to(device)
     
     # 前向传播
-    outputs = model(inputs)  # [batch_size, seq_len, vocab_size]
+    outputs = model(inputs)  # [batch_size, seq_len, vocab_size] - 预测每个位置的x1_token概率
     
     # 计算损失（展平为[batch_size*seq_len, vocab_size]和[batch_size*seq_len]）
+    # 目标：最小化预测 x1_token 与真实 x1_token 的交叉熵
     loss = criterion(outputs.view(-1, vocab_size), targets.view(-1))
     
     # 打印损失
@@ -406,20 +421,21 @@ for epoch in range(epochs):
 def generate_text(model, input_str, max_len=50):
     model.eval()  # 评估模式
     
-    # 将输入tokens转换为索引
+    # 将输入 x1_token 转换为索引
+    # input_str: 起始 x1_token 列表，如 ['x1_token1']
     input_tokens = [corpus.vocab[token] for token in input_str]
     output_tokens = input_tokens.copy()
     
     with torch.no_grad():  # 禁用梯度计算
         for _ in range(max_len):
-            # 将输出tokens转为张量
+            # 将当前已生成的 x1_token 索引序列转为张量
             inputs = torch.LongTensor(output_tokens).unsqueeze(0).to(device)
-            # inputs: [1, len(output_tokens)]
+            # inputs: [1, current_len] - 当前积累的 x1_token 序列
             
-            # 前向传播
-            outputs = model(inputs)  # [1, len(output_tokens), vocab_size]
+            # 前向传播，预测下一个 x1_token
+            outputs = model(inputs)  # [1, current_len, vocab_size]
             
-            # 取最后一个位置的最大概率词（贪心采样）
+            # 取最后一个位置的最大概率 x1_token（贪心采样）
             _, next_token = torch.max(outputs[:, -1, :], dim=-1)
             next_token = next_token.item()
             
@@ -427,17 +443,18 @@ def generate_text(model, input_str, max_len=50):
             if next_token == corpus.vocab["<eos>"]:
                 break
             
-            # 将新token添加到输出
+            # 将新生成的 x1_token 添加到输出序列
             output_tokens.append(next_token)
     
-    # 将索引转回文本
+    # 将 x1_token 索引序列转回文本
     output_str = " ".join([corpus.idx2word[token] for token in output_tokens])
     return output_str
 
 # 使用示例
-input_str = ["Python"]
+# 从起始 x1_token 开始自回归生成后续 x1_token
+input_str = ["x1_token1"]
 generated_text = generate_text(model, input_str)
-print("生成的文本：", generated_text)
+print("生成的 x1 序列：", generated_text)
 ```
 
 **生成过程说明**：
@@ -473,29 +490,31 @@ print("生成的文本：", generated_text)
 ### 完整流程
 
 ```
-文本语料库 (lang.txt)
+文本语料库 (lang.txt，包含x1_token)
     ↓
-LanguageCorpus (词表、批处理)
+x1_token索引化 + LanguageCorpus
     ↓
-GPT模型 (Decoder + Projection)
+x1批处理 [batch_size, seq_len]
     ↓
-训练循环 (前向→损失→反向→优化)
+GPT模型 (Decoder处理x1 + Projection输出概率)
     ↓
-训练好的模型
+训练循环：预测x1 → 损失 → 反向传播 → 优化
     ↓
-generate_text (自回归生成)
+训练好的模型（学会x1自回归）
     ↓
-生成的文本
+generate_text (自回归采样生成x1)
+    ↓
+生成的x1_token序列
 ```
 
 ### 实现步骤总结
 
-1. **数据准备**：读取文本文件，构建词表和批处理工具。
-2. **组件实现**：实现7个关键组件（注意力、前馈、位置编码、掩码、解码器层）。
-3. **模型搭建**：组合Decoder和Projection层形成完整GPT。
-4. **模型训练**：编写训练循环，持续优化参数。
-5. **文本生成**：实现自回归生成函数，支持任意起始词。
+1. **数据准备**：读取包含x1_token的文本文件，构建词表和批处理工具。
+2. **组件实现**：实现7个关键组件（多头注意力、前馈、位置编码、掩码、解码器层）。
+3. **模型搭建**：组合Decoder（处理x1隐藏状态）和Projection层（输出x1_token概率）形成完整GPT。
+4. **模型训练**：编写训练循环，用"前n-1个x1_token预测第n个x1_token"方式持续优化参数。
+5. **文本生成**：实现自回归生成函数，从起始x1_token自回归生成后续x1_token。
 
 ---
 
-**一句话总结**：GPT是"用Transformer解码器做自回归语言建模"，核心是数据预处理、掩码机制、解码器堆叠和自回归生成。
+**一句话总结**：GPT是"用Transformer解码器做x1隐藏状态的自回归语言建模"，核心是x1_token数据流、后续掩码防止"看未来"、多层解码器自注意力堆叠、以及自回归生成。
